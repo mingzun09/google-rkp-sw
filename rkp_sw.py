@@ -451,38 +451,81 @@ def fetch_eek(
     return challenge, eek_pub, eek_curve, eek_chains
 
 
+class RkpError(Exception):
+    """Base class for RKP provisioning errors."""
+
+
+class DeviceNotRegisteredError(RkpError):
+    """HTTP 444 — device DICE chain not endorsed by server."""
+
+
+class RkpClientError(RkpError):
+    """HTTP 4xx (except 444) — malformed request or auth failure."""
+
+
+class RkpServerError(RkpError):
+    """HTTP 5xx — server-side failure."""
+
+
 def submit_csr(
     csr_bytes: bytes,
     challenge: bytes,
     server_url: str = RKP_SERVER_URL,
 ) -> list[bytes]:
-    """Submit CSR to Google RKP server and return certificate chains."""
-    challenge_b64 = base64.urlsafe_b64encode(challenge).decode().rstrip('=')
+    """Submit CSR to Google RKP server and return certificate chains.
+
+    The response is a CBOR array(1) containing an inner array(2):
+    ``[[shared_cert_bytes, [unique_cert_bytes, ...]]]``
+
+    Each complete chain is ``shared_cert_bytes + unique_cert_bytes[i]``.
+
+    Raises:
+        DeviceNotRegisteredError: HTTP 444 from the server.
+        urllib.error.HTTPError: Any other non-200 response.
+    """
+    challenge_b64 = base64.urlsafe_b64encode(challenge).decode()
     url = f'{server_url}:signCertificates?challenge={challenge_b64}'
 
     print(f'  Submitting CSR to server...')
     req = urllib.request.Request(url, data=csr_bytes, method='POST')
     req.add_header('Content-Type', 'application/cbor')
 
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        data = resp.read()
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = resp.read()
+    except urllib.error.HTTPError as e:
+        error_body = e.read(1024).decode(errors='replace')
+        if e.code == 444:
+            raise DeviceNotRegisteredError(error_body) from e
+        if 400 <= e.code < 500:
+            raise RkpClientError(
+                f'HTTP {e.code}: {error_body}'
+            ) from e
+        if 500 <= e.code < 600:
+            raise RkpServerError(
+                f'HTTP {e.code}: {error_body}'
+            ) from e
+        raise
 
     result = cbor2.loads(data)
     print(f'  Response: {len(data)} bytes')
 
-    if isinstance(result, list):
-        certs = result[0] if isinstance(result[0], list) else result
-        if isinstance(certs, list) and len(certs) >= 2:
-            shared_chain = certs[0] if isinstance(certs[0], bytes) else b''
-            unique_chains = certs[1] if isinstance(certs[1], list) else []
-            all_chains = []
-            for uc in unique_chains:
-                if isinstance(uc, bytes):
-                    all_chains.append(shared_chain + uc)
-            print(f'  Received {len(all_chains)} certificate chain(s)')
-            return all_chains
+    # Outer array(1) → inner array(2): [shared_bytes, [unique_bytes, ...]]
+    if not isinstance(result, list) or not result:
+        return []
+    inner = result[0] if isinstance(result[0], list) else result
+    if not isinstance(inner, list) or len(inner) < 2:
+        return []
 
-    return []
+    shared = inner[0] if isinstance(inner[0], bytes) else b''
+    unique_list = inner[1] if isinstance(inner[1], list) else []
+
+    chains = []
+    for uc in unique_list:
+        if isinstance(uc, bytes):
+            chains.append(shared + uc)
+    print(f'  Received {len(chains)} certificate chain(s)')
+    return chains
 
 
 # ---------------------------------------------------------------------------
@@ -695,9 +738,20 @@ def cmd_provision(args: argparse.Namespace) -> None:
             for j, c in enumerate(certs):
                 print(f'    [{j}] {c.subject}')
 
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()[:300]
-        print(f'  HTTP {e.code}: {body}')
+    except DeviceNotRegisteredError as e:
+        print(f'  Device not registered: {e}')
+        with open('csr_output.cbor', 'wb') as f:
+            f.write(csr_bytes)
+        print(f'  CSR saved to csr_output.cbor')
+
+    except RkpClientError as e:
+        print(f'  Client error: {e}')
+        with open('csr_output.cbor', 'wb') as f:
+            f.write(csr_bytes)
+        print(f'  CSR saved to csr_output.cbor')
+
+    except RkpServerError as e:
+        print(f'  Server error: {e}')
         with open('csr_output.cbor', 'wb') as f:
             f.write(csr_bytes)
         print(f'  CSR saved to csr_output.cbor')
@@ -732,9 +786,8 @@ def cmd_keybox(args: argparse.Namespace) -> None:
     )
     try:
         ec_chains = submit_csr(csr_bytes, challenge, url)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()[:300]
-        print(f'Server error: HTTP {e.code}: {body}', file=sys.stderr)
+    except RkpError as e:
+        print(f'Provisioning failed: {e}', file=sys.stderr)
         sys.exit(1)
 
     if not ec_chains:
